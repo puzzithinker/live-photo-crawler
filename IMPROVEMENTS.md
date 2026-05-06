@@ -2,7 +2,7 @@
 
 ## Overview
 
-This report documents the improvements made to the live-photo-crawler project to support the new `live.pailixiang.com` domain and modernize the codebase.
+This report documents the improvements made to the live-photo-crawler project to support the new `live.pailixiang.com` domain, modernize the codebase, and harden the crawler against site changes and network failures.
 
 ---
 
@@ -166,6 +166,12 @@ Full conversion table for changes in `core/pailixiang.py` and `main.py`:
 | 张 → 張 | 張 | Photo counter |
 | 完成 → 完成 | 完成 (same) | — |
 | 进度 → 進度 | 進度 | Progress display |
+| 支持 → 支援 | 支援 | "Supported domain" |
+| 默认 → 預設 | 預設 | Default values |
+| 储存 → 儲存 | 儲存 | Storage path |
+| 输入 → 輸入 | 輸入 | Input prompts |
+| 请 → 請 | 請 | Polite requests |
+| 处理 → 處理 | 處理 | Processing status |
 
 ---
 
@@ -177,59 +183,197 @@ No tests existed. Changes to API logic, URL parsing, or download behavior were u
 
 ### After
 
-33 tests across 2 test files with full HTTP mocking (`unittest.mock.patch`):
+60 tests across 2 test files with full HTTP mocking (`unittest.mock.patch`):
 
-**`tests/test_pailixiang.py` — 25 tests**
+**`tests/test_pailixiang.py` — 46 tests**
 
 | Test Class | Tests | What It Verifies |
 |---|---|---|
 | `TestGenerateAk` | 4 | Output length = 3 + len(APP_KEY), first 3 chars are digits, randomness across calls, positions 0-14 of APP_KEY are preserved |
 | `TestBuildPayload` | 4 | All 7 required fields present, `pid` set correctly, kwargs merge correctly, `ak` is a non-empty string |
-| `TestDownloadImage` | 2 | Successful write to disk, graceful `False` return on network error |
+| `TestDownloadImage` | 4 | Successful write to disk, network error returns False, `ConnectionError` retry, `Timeout` retry |
+| `TestApiCall` | 7 | Success path, retry on error, max retries exhausted, `ak` regenerated per attempt, Code 9 cache invalidation + re-fetch, `ConnectionError` exponential backoff, `Timeout` exponential backoff |
+| `TestFetchCv` | 2 | HTML version extraction, fallback to `FALLBACK_CV` on network error |
+| `TestGetAppKey` | 2 | JS bundle extraction, fallback to `FALLBACK_APP_KEY` if key missing |
+| `TestFetchSpaVersion` | 2 | Version string parsing (`2.1.37` → `cv=137`), `SiteChangeError` on no match |
 | `TestApiAggGetView` | 2 | `g` prefix stripped from ID, multiple `g` chars stripped |
 | `TestApiAlbumGetView` | 1 | `a` prefix stripped from ID |
 | `TestApiAlbumSearchPhoto` | 1 | Default pagination: `StartIndex=1`, `SearchCount=80` |
-| `TestFetchAllPhotos` | 3 | Single page (1 API call), multi-page (2 API calls), empty album (0 results) |
-| `TestDownloadAggAlbums` | 2 | g-code extracted from URL, invalid URL returns None |
+| `TestFetchAllPhotos` | 4 | Single page (1 API call), multi-page (2 API calls), empty album (0 results), stops on `ApiError` |
+| `TestDownloadAggAlbums` | 3 | g-code extracted from URL, API error handling, invalid URL returns None |
 | `TestDownloadSingleAlbum` | 2 | a-code extracted from URL, invalid URL returns None |
 | `TestUrlParsingRegex` | 3 | `/g\d+` matches g-URLs, `/a\d+` matches a-URLs, no false matches from `/album/` path segment |
 
-**`tests/test_main.py` — 8 tests**
+**`tests/test_main.py` — 14 tests**
 
 | Test Class | Tests | What It Verifies |
 |---|---|---|
 | `TestLivePailixiangRouting` | 4 | g-URL → `download_agg_albums`, a-URL → `download_single_album`, unknown path → no call, query params stripped |
+| `TestDispatchUrl` | 5 | live.pailixiang.com → correct handler, www.pailixiang.com → legacy, photoplus → photoplus_init, unsupported domain → error, empty URL → skip |
 | `TestDomainRouting` | 3 | Hostname extraction for all 3 supported domains |
 | `TestPhotoplusInit` | 1 | Delegation to `photoplus_dl` |
 | `TestPailixiangInit` | 1 | Query string stripping before delegation |
+| `TestArgparse` | 5 | Positional URL parsing, multiple URLs, `-o` output flag, `-f` file flag, no-args → interactive mode |
 
 ### Test Strategy
 
 - All HTTP calls are mocked — tests run instantly with no network dependency
 - API request payloads are inspected to verify correct parameter passing
 - URL parsing is tested with both valid and invalid inputs
-- Edge cases: empty albums, multi-page pagination, network failures
+- Edge cases: empty albums, multi-page pagination, network failures, API errors
+- Retry logic tested with mock side effects for consecutive failures
+- Code 9 scenario tested with cache invalidation verification
 
 ---
 
-## 5. Code Structure Changes
+## 5. CLI: argparse Command Line Interface
+
+### Before
+
+The only way to use the crawler was interactive `input()` prompts:
+
+```python
+store_path = input("请输入储存路径 (默认: ./res): ")
+url = input("请输入即时照片URL: ")
+```
+
+This required manual intervention every run, couldn't be scripted, and only supported one URL per invocation.
+
+### After
+
+Full `argparse`-based CLI with batch support:
+
+```bash
+# Single URL
+python main.py https://live.pailixiang.com/album/main/g113328594
+
+# Custom output path
+python main.py -o /path/to/photos url1 url2
+
+# Batch from file
+python main.py -f urls.txt
+
+# No arguments → interactive mode (backward compatible)
+python main.py
+```
+
+| Flag | Short | Default | Description |
+|---|---|---|---|
+| `--output` | `-o` | `./res` | Photo storage path |
+| `--file` | `-f` | — | Read URLs from file (one per line, `#` comments) |
+
+### Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| Positional URL args | Most natural CLI usage — no flag needed for the primary input |
+| `-f` for file input | Enables batch processing without shell scripting |
+| Interactive fallback | Preserves backward compatibility for existing users |
+| Per-URL separator line | Visual clarity when processing multiple URLs |
+
+---
+
+## 6. Dynamic Configuration & Version Resilience
+
+### Problem
+
+The initial implementation hardcoded `cv="135"` and `appKey="1e3a58fb24de413c9873542fc5667a25"`. When the SPA updated to v2.1.37 (requiring `cv=137`), the API returned `{"Code": 9, "Msg": "有新版本需要刷新页面", "Data": null}`. The code tried to access `Data["Entity"]` on `null`, causing `TypeError: 'NoneType' object is not subscriptable`.
+
+### Solution: Dynamic Extraction
+
+Both `cv` and `appKey` are now extracted dynamically from the SPA at runtime:
+
+1. **`_fetch_spa_version()`** — Fetches `https://live.pailixiang.com/` HTML, extracts JS bundle URL via regex
+2. **`_fetch_app_key(js_url)`** — Fetches the JS bundle, extracts `appKey` via regex
+3. **`_fetch_cv()`** — Orchestrates both calls, caches results in module-level variables
+4. **`_get_app_key()`** — Returns cached or freshly extracted appKey
+
+Fallback values (`FALLBACK_CV = "137"`, `FALLBACK_APP_KEY = "..."`) are used when extraction fails (network error, site structure change).
+
+### Solution: Code 9 Auto-Recovery
+
+When the API returns `Code: 9` (version expired):
+
+1. `_CACHED_CV` and `_CACHED_APP_KEY` are set to `None` (invalidate cache)
+2. `_fetch_cv()` is called again to re-extract from the live SPA
+3. The API call is retried with the new `cv` and `appKey`
+4. Up to 3 retry attempts with regenerated `ak` each time
+
+### Solution: Site Change Detection
+
+`SiteChangeError` is raised when the SPA HTML structure no longer matches expected patterns (e.g., JS bundle URL format changed, `appKey` no longer in JS). This provides a clear signal that the crawler needs updating, rather than silently failing or producing cryptic errors.
+
+---
+
+## 7. Network Resilience & Error Handling
+
+### Before
+
+- No request timeouts — a hung connection would block indefinitely
+- No retry logic — any transient error was fatal
+- A single photo download failure would kill the entire batch
+- API errors were unhandled — direct dict access on potentially `null` data
+
+### After
+
+| Scenario | Handling |
+|---|---|
+| API returns `Code: 9` | Auto-invalidate cv/appKey cache, re-fetch from SPA, retry |
+| API returns non-zero Code | `ApiError` raised with code and message |
+| `ConnectionError` | Retry with exponential backoff (2s, 4s), up to 3 attempts |
+| `Timeout` | Retry with exponential backoff, up to 3 attempts |
+| Per-photo download failure | Isolated — `_download_image()` retries 3x then returns `False`, batch continues |
+| Failed photo files | Listed at end of album download with `✗` marker |
+| Network error during cv/appKey extraction | Falls back to hardcoded values with warning |
+| SPA HTML structure changes | `SiteChangeError` with descriptive message |
+
+### Key Constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `MAX_API_RETRIES` | 3 | Max retry attempts for API calls and image downloads |
+| `API_TIMEOUT` | 30 | Request timeout for API calls (seconds) |
+| `DOWNLOAD_TIMEOUT` | 60 | Request timeout for image downloads (seconds) |
+| `RETRY_BACKOFF` | 2 | Exponential backoff base (2^n seconds) |
+
+---
+
+## 8. Code Structure Changes
 
 ### `main.py`
 
-Added `live.pailixiang.com` domain handler with regex-based URL classification:
+Completely restructured from interactive prompts to argparse CLI:
 
 ```python
-def live_pailixiang_init(url: str, store_path: str):
-    path = urlparse(url).path
-    if re.search(r"/g\d+", path):
-        download_agg_albums(url.split("?")[0], store_path)
-    elif re.search(r"/a\d+", path):
-        download_single_album(url.split("?")[0], store_path)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="即時照片圖床爬取工具 — 支援拍立享 (pailixiang) 和 photoplus",
+    )
+    parser.add_argument("urls", nargs="*", help="一個或多個相冊URL")
+    parser.add_argument("-o", "--output", default="./res", help="照片儲存路徑")
+    parser.add_argument("-f", "--file", help="從檔案讀取URL列表")
+    return parser
 ```
+
+New functions:
+
+| Function | Purpose |
+|---|---|
+| `build_parser()` | Construct argparse parser with CLI flags |
+| `read_urls_from_file(filepath)` | Read URL list from text file |
+| `interactive_mode()` | Fallback interactive input (no-args) |
+| `main()` | CLI entry point — parse args, dispatch URLs |
+
+Modified function:
+
+| Function | Change |
+|---|---|
+| `dispatch_url()` | Added empty URL guard, unsupported domain error in Traditional Chinese |
+| `live_pailixiang_init()` | Query params stripped before dispatch |
 
 ### `core/pailixiang.py`
 
-New public functions added:
+New public functions:
 
 | Function | Purpose |
 |---|---|
@@ -240,14 +384,26 @@ New internal functions:
 
 | Function | Purpose |
 |---|---|
+| `_api_call(url, payload)` | Unified API call with retry, Code 9 handling, error conversion |
 | `_generate_ak()` | Generate per-request authentication token |
 | `_build_payload(pid, **kwargs)` | Build common API request payload with `ak` |
+| `_fetch_cv()` | Get client version (cache → dynamic → fallback) |
+| `_get_app_key()` | Get app key (cache → dynamic → fallback) |
+| `_fetch_spa_version()` | Extract version string + JS bundle URL from SPA HTML |
+| `_fetch_app_key(js_url)` | Extract appKey from JS bundle |
 | `_api_agg_get_view(code)` | Call AggGetView API |
 | `_api_album_get_view(code)` | Call AlbumGetView API |
 | `_api_album_search_photo(album_id, start_index, count)` | Call AlbumSearchPhoto API |
 | `_fetch_all_photos(album_id)` | Paginate through all photo pages |
 | `_download_album_by_code(album_code, store_path)` | Orchestrate album download with concurrency |
-| `_download_image(url, filepath)` | Download single image with error handling |
+| `_download_image(url, filepath)` | Download single image with retry and error handling |
+
+New exception classes:
+
+| Class | Purpose |
+|---|---|
+| `ApiError` | API response error (non-zero Code), carries `code` and `msg` |
+| `SiteChangeError` | SPA HTML structure changed, cannot extract expected fields |
 
 Legacy function `download_all_images()` preserved for `www.pailixiang.com` support.
 
@@ -261,5 +417,11 @@ Legacy function `download_all_images()` preserved for `www.pailixiang.com` suppo
 | Download concurrency | Sequential (1 image at a time) | 8 parallel workers via ThreadPoolExecutor |
 | Download progress | Per-image print | Live counter: `下載進度: 42/666` |
 | Chinese locale | Mixed Simplified + typo | Consistent Traditional Chinese |
-| Test coverage | 0 tests | 33 tests with full HTTP mocking |
+| Test coverage | 0 tests | 60 tests with full HTTP mocking |
 | API authentication | N/A (HTML scraping) | Reverse-engineered `ak` generation from SPA JS |
+| CLI interface | Interactive `input()` prompts only | argparse CLI + batch file + interactive fallback |
+| Configuration | Hardcoded `cv` and `appKey` | Dynamic extraction from SPA + fallback values |
+| Version expiry | Fatal crash (`NoneType` error) | Auto-recovery: cache invalidation + re-fetch + retry |
+| Network errors | Fatal — no timeout, no retry | Timeouts (30s/60s) + 3x retry with exponential backoff |
+| Download failures | One failure kills the batch | Per-photo isolation + failure summary |
+| Site changes | Silent failure or crash | `SiteChangeError` with descriptive message |

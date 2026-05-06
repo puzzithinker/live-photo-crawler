@@ -9,6 +9,27 @@ API_BASE = "https://mapi.pailixiang.com/plx"
 APP_KEY = "1e3a58fb24de413c9873542fc5667a25"
 PAGE_SIZE = 80
 MAX_WORKERS = 8
+MAX_API_RETRIES = 3
+SPA_BASE = "https://abms.pailixiang.com"
+_CACHED_CV = None
+
+
+def _fetch_cv() -> str:
+    global _CACHED_CV
+    if _CACHED_CV is not None:
+        return _CACHED_CV
+    try:
+        html = requests.get("https://live.pailixiang.com/", headers={
+            "User-Agent": HEADERS["User-Agent"],
+        }).text
+        match = re.search(r'abms\.pailixiang\.com/(\d+)\.(\d+)\.(\d+)/', html)
+        if match:
+            _CACHED_CV = match.group(2) + match.group(3)
+            return _CACHED_CV
+    except requests.RequestException:
+        pass
+    _CACHED_CV = "137"
+    return _CACHED_CV
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -35,13 +56,35 @@ def _build_payload(pid: str, **kwargs) -> dict:
         "ClientType": 0,
         "tt": "",
         "ct": 0,
-        "cv": "135",
+        "cv": _fetch_cv(),
         "lang": "cn",
         "pid": pid,
         "ak": _generate_ak(),
     }
     payload.update(kwargs)
     return payload
+
+
+class ApiError(Exception):
+    def __init__(self, code: int, msg: str):
+        self.code = code
+        self.msg = msg
+        super().__init__(f"API error {code}: {msg}")
+
+
+def _api_call(url: str, payload: dict) -> dict:
+    for attempt in range(1, MAX_API_RETRIES + 1):
+        payload["ak"] = _generate_ak()
+        resp = requests.post(url, json=payload, headers=HEADERS)
+        resp.raise_for_status()
+        body = resp.json()
+        code = body.get("Code", -1)
+        if code == 0:
+            return body.get("Data")
+        if attempt < MAX_API_RETRIES:
+            print(f"API回應錯誤 (嘗試 {attempt}/{MAX_API_RETRIES}): [{code}] {body.get('Msg', '')}")
+        else:
+            raise ApiError(code, body.get("Msg", "未知錯誤"))
 
 
 def _download_image(url: str, filepath: str) -> bool:
@@ -67,9 +110,7 @@ def _api_agg_get_view(code: str) -> dict:
         ID=code.lstrip("g"),
         SourceType="",
     )
-    resp = requests.post(f"{API_BASE}/WapAgg/AggGetView", json=payload, headers=HEADERS)
-    resp.raise_for_status()
-    return resp.json()["Data"]
+    return _api_call(f"{API_BASE}/WapAgg/AggGetView", payload)
 
 
 def _api_album_get_view(code: str) -> dict:
@@ -78,9 +119,7 @@ def _api_album_get_view(code: str) -> dict:
         ID=code.lstrip("a"),
         AccessType="",
     )
-    resp = requests.post(f"{API_BASE}/WapAbm/AlbumGetView", json=payload, headers=HEADERS)
-    resp.raise_for_status()
-    return resp.json()["Data"]
+    return _api_call(f"{API_BASE}/WapAbm/AlbumGetView", payload)
 
 
 def _api_album_search_photo(album_id: str, start_index: int = 1, count: int = PAGE_SIZE) -> list:
@@ -98,9 +137,7 @@ def _api_album_search_photo(album_id: str, start_index: int = 1, count: int = PA
         SortType=1,
         OptTime="",
     )
-    resp = requests.post(f"{API_BASE}/WapAbm/AlbumSearchPhoto", json=payload, headers=HEADERS)
-    resp.raise_for_status()
-    return resp.json()["Data"]
+    return _api_call(f"{API_BASE}/WapAbm/AlbumSearchPhoto", payload)
 
 
 def _fetch_all_photos(album_id: str) -> list:
@@ -108,7 +145,11 @@ def _fetch_all_photos(album_id: str) -> list:
     page = 1
     while True:
         start = (page - 1) * PAGE_SIZE + 1
-        photos = _api_album_search_photo(album_id, start_index=start)
+        try:
+            photos = _api_album_search_photo(album_id, start_index=start)
+        except ApiError as err:
+            print(f"\n取得照片列表失敗 (頁{page}): {err}")
+            break
         if not photos:
             break
         all_photos.extend(photos)
@@ -122,7 +163,11 @@ def _download_album_by_code(album_code: str, store_path: str):
     if not os.path.exists(store_path):
         os.makedirs(store_path)
 
-    album_data = _api_album_get_view(album_code)
+    try:
+        album_data = _api_album_get_view(album_code)
+    except ApiError as err:
+        print(f"取得相冊資訊失敗: {err}")
+        return
     album_entity = album_data["Entity"]
     album_name = album_entity.get("Title", album_code)
     album_id = album_entity["ID"]
@@ -165,7 +210,11 @@ def download_agg_albums(url: str, store_path: str):
     agg_code = match.group(1)
     print(f"聚合頁編號: g{agg_code}")
 
-    agg_data = _api_agg_get_view(agg_code)
+    try:
+        agg_data = _api_agg_get_view(agg_code)
+    except ApiError as err:
+        print(f"取得聚合頁資訊失敗: {err}")
+        return
     entity = agg_data["Entity"]
     print(f"活動: {entity.get('Title', entity.get('Name', 'Unknown'))}")
 

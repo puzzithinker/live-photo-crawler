@@ -9,12 +9,29 @@ from core.pailixiang import (
     _api_agg_get_view,
     _api_album_get_view,
     _api_album_search_photo,
+    _api_call,
     _fetch_all_photos,
     download_agg_albums,
     download_single_album,
+    ApiError,
     APP_KEY,
     PAGE_SIZE,
+    MAX_API_RETRIES,
 )
+
+
+def _mock_ok_response(data):
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"Code": 0, "Msg": "", "Data": data}
+    mock_resp.raise_for_status = MagicMock()
+    return mock_resp
+
+
+def _mock_error_response(code=8, msg="非法请求"):
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"Code": code, "Msg": msg, "Data": None}
+    mock_resp.raise_for_status = MagicMock()
+    return mock_resp
 
 
 class TestGenerateAk(unittest.TestCase):
@@ -85,14 +102,52 @@ class TestDownloadImage(unittest.TestCase):
         self.assertFalse(result)
 
 
+class TestApiCall(unittest.TestCase):
+    @patch("core.pailixiang.requests.post")
+    def test_success_returns_data(self, mock_post):
+        mock_post.return_value = _mock_ok_response({"Entity": {"Title": "Test"}})
+        result = _api_call("https://example.com/api", {"pid": "test", "ak": "old"})
+        self.assertEqual(result, {"Entity": {"Title": "Test"}})
+
+    @patch("core.pailixiang.requests.post")
+    def test_retries_on_error_then_succeeds(self, mock_post):
+        mock_post.side_effect = [
+            _mock_error_response(8, "非法请求"),
+            _mock_ok_response({"Entity": {"Title": "OK"}}),
+        ]
+        result = _api_call("https://example.com/api", {"pid": "test", "ak": "old"})
+        self.assertEqual(result, {"Entity": {"Title": "OK"}})
+        self.assertEqual(mock_post.call_count, 2)
+
+    @patch("core.pailixiang.requests.post")
+    def test_raises_after_max_retries(self, mock_post):
+        mock_post.return_value = _mock_error_response(8, "非法请求")
+        with self.assertRaises(ApiError) as ctx:
+            _api_call("https://example.com/api", {"pid": "test", "ak": "old"})
+        self.assertEqual(ctx.exception.code, 8)
+        self.assertEqual(ctx.exception.msg, "非法请求")
+        self.assertEqual(mock_post.call_count, MAX_API_RETRIES)
+
+    @patch("core.pailixiang.requests.post")
+    def test_regenerates_ak_on_each_retry(self, mock_post):
+        mock_post.side_effect = [
+            _mock_error_response(8, "fail1"),
+            _mock_error_response(8, "fail2"),
+            _mock_ok_response("success"),
+        ]
+        _api_call("https://example.com/api", {"pid": "test", "ak": "initial"})
+        aks_used = []
+        for call in mock_post.call_args_list:
+            payload = call.kwargs.get("json") or call[1].get("json")
+            aks_used.append(payload["ak"])
+        self.assertEqual(len(aks_used), 3)
+        self.assertNotEqual(aks_used[0], "initial")
+
+
 class TestApiAggGetView(unittest.TestCase):
     @patch("core.pailixiang.requests.post")
     def test_extracts_id_without_g_prefix(self, mock_post):
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"Data": {"Entity": {"Title": "Test"}}}
-        mock_resp.raise_for_status = MagicMock()
-        mock_post.return_value = mock_resp
-
+        mock_post.return_value = _mock_ok_response({"Entity": {"Title": "Test"}})
         _api_agg_get_view("g113328594")
         call_args = mock_post.call_args
         payload = call_args.kwargs.get("json") or call_args[1].get("json")
@@ -100,11 +155,7 @@ class TestApiAggGetView(unittest.TestCase):
 
     @patch("core.pailixiang.requests.post")
     def test_strips_multiple_g(self, mock_post):
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"Data": {"Entity": {"Title": "Test"}}}
-        mock_resp.raise_for_status = MagicMock()
-        mock_post.return_value = mock_resp
-
+        mock_post.return_value = _mock_ok_response({"Entity": {"Title": "Test"}})
         _api_agg_get_view("gg123")
         call_args = mock_post.call_args
         payload = call_args.kwargs.get("json") or call_args[1].get("json")
@@ -114,11 +165,7 @@ class TestApiAggGetView(unittest.TestCase):
 class TestApiAlbumGetView(unittest.TestCase):
     @patch("core.pailixiang.requests.post")
     def test_extracts_id_without_a_prefix(self, mock_post):
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"Data": {"Entity": {"ID": "inner-id", "Title": "Album"}}}
-        mock_resp.raise_for_status = MagicMock()
-        mock_post.return_value = mock_resp
-
+        mock_post.return_value = _mock_ok_response({"Entity": {"ID": "inner-id", "Title": "Album"}})
         _api_album_get_view("a12096096366")
         call_args = mock_post.call_args
         payload = call_args.kwargs.get("json") or call_args[1].get("json")
@@ -128,11 +175,7 @@ class TestApiAlbumGetView(unittest.TestCase):
 class TestApiAlbumSearchPhoto(unittest.TestCase):
     @patch("core.pailixiang.requests.post")
     def test_default_pagination(self, mock_post):
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"Data": []}
-        mock_resp.raise_for_status = MagicMock()
-        mock_post.return_value = mock_resp
-
+        mock_post.return_value = _mock_ok_response([])
         _api_album_search_photo("album-123")
         call_args = mock_post.call_args
         payload = call_args.kwargs.get("json") or call_args[1].get("json")
@@ -164,6 +207,14 @@ class TestFetchAllPhotos(unittest.TestCase):
         result = _fetch_all_photos("album-1")
         self.assertEqual(result, [])
 
+    @patch("core.pailixiang._api_album_search_photo")
+    def test_stops_on_api_error(self, mock_search):
+        from core.pailixiang import ApiError
+        page1 = [{"Name": f"img{i}.jpg"} for i in range(PAGE_SIZE)]
+        mock_search.side_effect = [page1, ApiError(8, "非法请求")]
+        result = _fetch_all_photos("album-1")
+        self.assertEqual(len(result), PAGE_SIZE)
+
 
 class TestDownloadAggAlbums(unittest.TestCase):
     @patch("core.pailixiang._download_album_by_code")
@@ -176,6 +227,12 @@ class TestDownloadAggAlbums(unittest.TestCase):
         download_agg_albums("https://live.pailixiang.com/album/main/g113328594", "/tmp/test")
         mock_agg.assert_called_once_with("113328594")
         mock_dl.assert_called_once()
+
+    @patch("core.pailixiang._api_agg_get_view")
+    def test_api_error_returns_gracefully(self, mock_agg):
+        mock_agg.side_effect = ApiError(8, "非法请求")
+        result = download_agg_albums("https://live.pailixiang.com/album/main/g113328594", "/tmp/test")
+        self.assertIsNone(result)
 
     def test_invalid_url(self):
         result = download_agg_albums("https://example.com/no-code", "/tmp/test")

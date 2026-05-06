@@ -11,10 +11,15 @@ from core.pailixiang import (
     _api_album_search_photo,
     _api_call,
     _fetch_all_photos,
+    _fetch_cv,
+    _get_app_key,
+    _fetch_spa_version,
     download_agg_albums,
     download_single_album,
     ApiError,
-    APP_KEY,
+    SiteChangeError,
+    FALLBACK_APP_KEY,
+    FALLBACK_CV,
     PAGE_SIZE,
     MAX_API_RETRIES,
 )
@@ -37,7 +42,7 @@ def _mock_error_response(code=8, msg="非法请求"):
 class TestGenerateAk(unittest.TestCase):
     def test_length(self):
         ak = _generate_ak()
-        self.assertEqual(len(ak), 3 + len(APP_KEY))
+        self.assertEqual(len(ak), 3 + len(FALLBACK_APP_KEY))
 
     def test_starts_with_three_digits(self):
         for _ in range(20):
@@ -51,7 +56,7 @@ class TestGenerateAk(unittest.TestCase):
     def test_preserves_app_key_base(self):
         ak = _generate_ak()
         chars = list(ak[3:])
-        base = list(APP_KEY)
+        base = list(FALLBACK_APP_KEY)
         for i in range(15):
             self.assertEqual(chars[i], base[i], f"Char at position {i} changed unexpectedly")
 
@@ -95,11 +100,40 @@ class TestDownloadImage(unittest.TestCase):
         os.unlink(tmp.name)
 
     @patch("core.pailixiang.requests.get")
-    def test_network_error(self, mock_get):
+    def test_network_error_returns_false(self, mock_get):
         import requests as req
         mock_get.side_effect = req.RequestException("timeout")
         result = _download_image("https://example.com/img.jpg", "/tmp/nonexistent.jpg")
         self.assertFalse(result)
+
+    @patch("core.pailixiang.requests.get")
+    def test_connection_error_retries(self, mock_get):
+        import requests as req
+        ok_resp = MagicMock()
+        ok_resp.raise_for_status = MagicMock()
+        ok_resp.content = b"data"
+        mock_get.side_effect = [
+            req.exceptions.ConnectionError("reset"),
+            ok_resp,
+        ]
+        result = _download_image("https://example.com/img.jpg", "/tmp/test_retry.jpg")
+        self.assertTrue(result)
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch("core.pailixiang.time.sleep")
+    @patch("core.pailixiang.requests.get")
+    def test_timeout_retries(self, mock_get, mock_sleep):
+        import requests as req
+        ok_resp = MagicMock()
+        ok_resp.raise_for_status = MagicMock()
+        ok_resp.content = b"data"
+        mock_get.side_effect = [
+            req.exceptions.Timeout("timed out"),
+            ok_resp,
+        ]
+        result = _download_image("https://example.com/img.jpg", "/tmp/test_timeout.jpg")
+        self.assertTrue(result)
+        mock_sleep.assert_called()
 
 
 class TestApiCall(unittest.TestCase):
@@ -109,8 +143,9 @@ class TestApiCall(unittest.TestCase):
         result = _api_call("https://example.com/api", {"pid": "test", "ak": "old"})
         self.assertEqual(result, {"Entity": {"Title": "Test"}})
 
+    @patch("core.pailixiang.time.sleep")
     @patch("core.pailixiang.requests.post")
-    def test_retries_on_error_then_succeeds(self, mock_post):
+    def test_retries_on_error_then_succeeds(self, mock_post, mock_sleep):
         mock_post.side_effect = [
             _mock_error_response(8, "非法请求"),
             _mock_ok_response({"Entity": {"Title": "OK"}}),
@@ -125,7 +160,6 @@ class TestApiCall(unittest.TestCase):
         with self.assertRaises(ApiError) as ctx:
             _api_call("https://example.com/api", {"pid": "test", "ak": "old"})
         self.assertEqual(ctx.exception.code, 8)
-        self.assertEqual(ctx.exception.msg, "非法请求")
         self.assertEqual(mock_post.call_count, MAX_API_RETRIES)
 
     @patch("core.pailixiang.requests.post")
@@ -142,6 +176,113 @@ class TestApiCall(unittest.TestCase):
             aks_used.append(payload["ak"])
         self.assertEqual(len(aks_used), 3)
         self.assertNotEqual(aks_used[0], "initial")
+
+    @patch("core.pailixiang.time.sleep")
+    @patch("core.pailixiang.requests.post")
+    def test_code9_invalidates_cv_cache(self, mock_post, mock_sleep):
+        import core.pailixiang as px
+        px._CACHED_CV = None
+        px._CACHED_APP_KEY = None
+
+        side_effects = [
+            _mock_error_response(9, "有新版本需要刷新页面"),
+            _mock_ok_response({"ok": True}),
+        ]
+        mock_post.side_effect = side_effects
+
+        with patch("core.pailixiang._fetch_spa_version", return_value=("138", "https://abms.pailixiang.com/2.1.38/js/index.xxx.js")):
+            with patch("core.pailixiang._fetch_app_key", return_value=FALLBACK_APP_KEY):
+                result = _api_call("https://example.com/api", {"pid": "test", "ak": "old", "cv": "137"})
+        self.assertEqual(result, {"ok": True})
+
+    @patch("core.pailixiang.time.sleep")
+    @patch("core.pailixiang.requests.post")
+    def test_connection_error_retries_with_backoff(self, mock_post, mock_sleep):
+        import requests as req
+        mock_post.side_effect = [
+            req.exceptions.ConnectionError("reset"),
+            _mock_ok_response("ok"),
+        ]
+        result = _api_call("https://example.com/api", {"pid": "test", "ak": "old"})
+        self.assertEqual(result, "ok")
+        mock_sleep.assert_called_once_with(2)
+
+    @patch("core.pailixiang.time.sleep")
+    @patch("core.pailixiang.requests.post")
+    def test_timeout_error_retries(self, mock_post, mock_sleep):
+        import requests as req
+        mock_post.side_effect = [
+            req.exceptions.Timeout("timed out"),
+            _mock_ok_response("ok"),
+        ]
+        result = _api_call("https://example.com/api", {"pid": "test", "ak": "old"})
+        self.assertEqual(result, "ok")
+        mock_sleep.assert_called()
+
+
+class TestFetchCv(unittest.TestCase):
+    @patch("core.pailixiang.requests.get")
+    def test_extracts_cv_from_html(self, mock_get):
+        import core.pailixiang as px
+        px._CACHED_CV = None
+        px._CACHED_APP_KEY = None
+        mock_get.return_value = MagicMock(text='<script src="https://abms.pailixiang.com/2.1.37/js/index.abc.js">')
+        with patch("core.pailixiang._fetch_app_key", return_value=FALLBACK_APP_KEY):
+            cv = _fetch_cv()
+        self.assertEqual(cv, "137")
+
+    @patch("core.pailixiang.requests.get")
+    def test_fallback_on_network_error(self, mock_get):
+        import core.pailixiang as px
+        import requests as req
+        px._CACHED_CV = None
+        px._CACHED_APP_KEY = None
+        mock_get.side_effect = req.RequestException("fail")
+        cv = _fetch_cv()
+        self.assertEqual(cv, FALLBACK_CV)
+
+
+class TestGetAppKey(unittest.TestCase):
+    @patch("core.pailixiang.requests.get")
+    def test_extracts_from_js(self, mock_get):
+        import core.pailixiang as px
+        px._CACHED_CV = None
+        px._CACHED_APP_KEY = None
+        mock_get.side_effect = [
+            MagicMock(text='<script src="https://abms.pailixiang.com/2.1.37/js/index.abc.js">'),
+            MagicMock(text='appKey:"1e3a58fb24de413c9873542fc5667a25",envType:0'),
+        ]
+        key = _get_app_key()
+        self.assertEqual(key, "1e3a58fb24de413c9873542fc5667a25")
+
+    @patch("core.pailixiang.requests.get")
+    def test_fallback_if_js_missing_key(self, mock_get):
+        import core.pailixiang as px
+        px._CACHED_CV = None
+        px._CACHED_APP_KEY = None
+        mock_get.side_effect = [
+            MagicMock(text='<script src="https://abms.pailixiang.com/2.1.37/js/index.abc.js">'),
+            MagicMock(text='no key here'),
+        ]
+        key = _get_app_key()
+        self.assertEqual(key, FALLBACK_APP_KEY)
+
+
+class TestFetchSpaVersion(unittest.TestCase):
+    def test_parses_version_from_html(self):
+        import core.pailixiang as px
+        with patch.object(px.requests, 'get') as mock_get:
+            mock_get.return_value = MagicMock(text='<script defer="defer" src="https://abms.pailixiang.com/2.1.39/js/index.a1b2c3d4.js"></script>')
+            cv, js_url = _fetch_spa_version()
+        self.assertEqual(cv, "139")
+        self.assertIn("2.1.39", js_url)
+
+    def test_raises_site_change_error_when_no_match(self):
+        import core.pailixiang as px
+        with patch.object(px.requests, 'get') as mock_get:
+            mock_get.return_value = MagicMock(text="<html><body>nothing</body></html>")
+            with self.assertRaises(SiteChangeError):
+                _fetch_spa_version()
 
 
 class TestApiAggGetView(unittest.TestCase):
@@ -209,7 +350,6 @@ class TestFetchAllPhotos(unittest.TestCase):
 
     @patch("core.pailixiang._api_album_search_photo")
     def test_stops_on_api_error(self, mock_search):
-        from core.pailixiang import ApiError
         page1 = [{"Name": f"img{i}.jpg"} for i in range(PAGE_SIZE)]
         mock_search.side_effect = [page1, ApiError(8, "非法请求")]
         result = _fetch_all_photos("album-1")

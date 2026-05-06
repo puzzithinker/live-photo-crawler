@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlparse
 
-from main import live_pailixiang_init, photoplus_init, pailixiang_init
+from main import dispatch_url, live_pailixiang_init, photoplus_init, pailixiang_init, build_parser
 
 
 class TestLivePailixiangRouting(unittest.TestCase):
@@ -29,6 +29,33 @@ class TestLivePailixiangRouting(unittest.TestCase):
         mock_agg.assert_called_once_with("https://live.pailixiang.com/album/main/g123", "/tmp/test")
 
 
+class TestDispatchUrl(unittest.TestCase):
+    @patch("main.live_pailixiang_init")
+    def test_dispatches_live_pailixiang(self, mock_init):
+        dispatch_url("https://live.pailixiang.com/album/main/g123", "/tmp/test")
+        mock_init.assert_called_once()
+
+    @patch("main.pailixiang_init")
+    def test_dispatches_www_pailixiang(self, mock_init):
+        dispatch_url("https://www.pailixiang.com/Album?id=123", "/tmp/test")
+        mock_init.assert_called_once()
+
+    @patch("main.photoplus_init")
+    def test_dispatches_photoplus(self, mock_init):
+        dispatch_url("https://live.photoplus.cn/live/12345", "/tmp/test")
+        mock_init.assert_called_once()
+
+    def test_unsupported_domain_prints_error(self):
+        with patch("builtins.print") as mock_print:
+            dispatch_url("https://example.com/whatever", "/tmp/test")
+            mock_print.assert_any_call("不支援的域名: example.com")
+
+    def test_empty_url_ignored(self):
+        with patch("builtins.print") as mock_print:
+            dispatch_url("", "/tmp/test")
+            mock_print.assert_not_called()
+
+
 class TestDomainRouting(unittest.TestCase):
     def test_live_pailixiang_hostname(self):
         self.assertEqual(urlparse("https://live.pailixiang.com/album/main/g123").hostname, "live.pailixiang.com")
@@ -52,6 +79,37 @@ class TestPailixiangInit(unittest.TestCase):
     def test_strips_query(self, mock_dl):
         pailixiang_init("https://www.pailixiang.com/Album?id=123&foo=bar", "/tmp/test")
         mock_dl.assert_called_once_with("https://www.pailixiang.com/Album", "/tmp/test")
+
+
+class TestArgparse(unittest.TestCase):
+    def test_positional_url(self):
+        parser = build_parser()
+        args = parser.parse_args(["https://live.pailixiang.com/album/main/g123"])
+        self.assertEqual(args.urls, ["https://live.pailixiang.com/album/main/g123"])
+        self.assertEqual(args.output, "./res")
+
+    def test_multiple_urls(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "https://live.pailixiang.com/album/main/g123",
+            "https://live.pailixiang.com/album/a456",
+        ])
+        self.assertEqual(len(args.urls), 2)
+
+    def test_output_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["-o", "/tmp/photos", "https://example.com"])
+        self.assertEqual(args.output, "/tmp/photos")
+
+    def test_file_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["-f", "urls.txt"])
+        self.assertEqual(args.file, "urls.txt")
+
+    def test_no_urls_defaults_empty(self):
+        parser = build_parser()
+        args = parser.parse_args([])
+        self.assertEqual(args.urls, [])
 
 
 if __name__ == "__main__":

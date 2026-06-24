@@ -379,6 +379,75 @@ class TestDownloadAggAlbums(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestSanitizeDirname(unittest.TestCase):
+    def test_strips_windows_reserved_chars(self):
+        from core.pailixiang import _sanitize_dirname
+        self.assertEqual(_sanitize_dirname('a/b\\c:d*e?f"g<h>i|j'), 'a b c d e f g h i j')
+
+    def test_strips_newlines_and_control_chars(self):
+        from core.pailixiang import _sanitize_dirname
+        # Reproduces the WinError 123 path from issue report (embedded \n in album Name)
+        name = "葡語國家/地區保險監管專員協會監管人員培訓研討會\nCONFERÊNCIA\n中國澳門 Macau, China"
+        cleaned = _sanitize_dirname(name)
+        self.assertNotIn("\n", cleaned)
+        self.assertNotIn("/", cleaned)
+        self.assertFalse(cleaned.startswith(" ") or cleaned.endswith(" "))
+
+    def test_strips_trailing_dot(self):
+        from core.pailixiang import _sanitize_dirname
+        self.assertEqual(_sanitize_dirname("album."), "album")
+        self.assertEqual(_sanitize_dirname("album1. ."), "album1")
+        self.assertEqual(_sanitize_dirname("ends . "), "ends")
+
+    def test_collapses_whitespace(self):
+        from core.pailixiang import _sanitize_dirname
+        self.assertEqual(_sanitize_dirname("a   b\t\tc"), "a b c")
+
+    def test_truncates(self):
+        from core.pailixiang import _sanitize_dirname
+        long_name = "x" * 200
+        self.assertEqual(len(_sanitize_dirname(long_name, max_len=50)), 50)
+
+    def test_handles_br_tag_fallback(self):
+        # Aggregation caller strips <br /> to " " before sanitizing (pailixiang.py line 340);
+        # the sanitizer itself strips < > as Windows reserved chars — verify the post-strip input works.
+        from core.pailixiang import _sanitize_dirname
+        self.assertEqual(_sanitize_dirname("Title Subtitle"), "Title Subtitle")
+        # Any residual <br /> in input has its <, >, and / chars replaced with space.
+        self.assertEqual(_sanitize_dirname("Title<br />Subtitle"), "Title br Subtitle")
+
+
+class TestPickImageUrl(unittest.TestCase):
+    def test_prefers_downloadImageUrl_when_http_url(self):
+        from core.pailixiang import _pick_image_url
+        photo = {"DownloadImageUrl": "https://cdn.example.com/full.jpg",
+                 "BigImageUrl": "https://cdn.example.com/big.jpg",
+                 "ImageUrl": "https://cdn.example.com/small.jpg"}
+        self.assertEqual(_pick_image_url(photo), "https://cdn.example.com/full.jpg")
+
+    def test_falls_back_to_bigImageUrl_when_downloadUrl_is_pipe_format(self):
+        from core.pailixiang import _pick_image_url
+        # When album disables full-res downloads (IsPhotoDownload=False), the API
+        # returns a pipe-delimited transfer ID instead of a URL — must fall back.
+        photo = {"DownloadImageUrl": "688694296140802|f61b6731-60b0-4947-8def-deef36201220|.jpg|0",
+                 "BigImageUrl": "https://thumbnail0.baidupcs.com/thumbnail/abc?size=c1600_u1600",
+                 "ImageUrl": "https://thumbnail0.baidupcs.com/thumbnail/abc?size=c750_u1125"}
+        self.assertEqual(_pick_image_url(photo),
+                         "https://thumbnail0.baidupcs.com/thumbnail/abc?size=c1600_u1600")
+
+    def test_falls_back_to_imageUrl_when_bigImageUrl_missing(self):
+        from core.pailixiang import _pick_image_url
+        photo = {"DownloadImageUrl": "N/A",
+                 "BigImageUrl": None,
+                 "ImageUrl": "https://cdn.example.com/small.jpg"}
+        self.assertEqual(_pick_image_url(photo), "https://cdn.example.com/small.jpg")
+
+    def test_returns_empty_when_no_valid_url(self):
+        from core.pailixiang import _pick_image_url
+        self.assertEqual(_pick_image_url({}), "")
+        self.assertEqual(_pick_image_url({"DownloadImageUrl": "garbage", "BigImageUrl": ""}), "")
+
+
 class TestDownloadSingleAlbum(unittest.TestCase):
     @patch("core.pailixiang._download_album_by_code")
     def test_extracts_a_code(self, mock_dl):

@@ -172,6 +172,8 @@ def _api_call(url: str, payload: dict) -> dict:
 
 
 def _download_image(url: str, filepath: str) -> bool:
+    if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return False
     for attempt in range(1, MAX_API_RETRIES + 1):
         try:
             response = requests.get(
@@ -259,6 +261,22 @@ def _fetch_all_photos(album_id: str) -> list:
     return all_photos
 
 
+def _pick_image_url(photo: dict) -> str:
+    """Pick the best download URL for a photo.
+
+    `DownloadImageUrl` is only a real URL when the album owner permits full-resolution
+    downloads (IsPhotoDownload=True). When downloads are disabled the API returns a
+    pipe-delimited transfer-ID placeholder (e.g. "ID|guid|.jpg|0") which is NOT a URL.
+    Fall back to BigImageUrl (largest public preview) then ImageUrl (smaller preview)
+    so the crawler still works against restricted albums.
+    """
+    candidates = (photo.get("DownloadImageUrl"), photo.get("BigImageUrl"), photo.get("ImageUrl"))
+    for url in candidates:
+        if url and isinstance(url, str) and url.startswith(("http://", "https://")):
+            return url
+    return ""
+
+
 def _download_album_by_code(album_code: str, store_path: str):
     if not os.path.exists(store_path):
         os.makedirs(store_path)
@@ -287,7 +305,8 @@ def _download_album_by_code(album_code: str, store_path: str):
         futures = {}
         for idx, photo in enumerate(all_photos, start=1):
             filepath = os.path.join(store_path, photo["Name"])
-            futures[executor.submit(_download_image, photo["DownloadImageUrl"], filepath)] = (idx, photo["Name"])
+            url = _pick_image_url(photo)
+            futures[executor.submit(_download_image, url, filepath)] = (idx, photo["Name"])
 
         for future in as_completed(futures):
             idx, name = futures[future]
@@ -304,6 +323,20 @@ def _download_album_by_code(album_code: str, store_path: str):
             print(f"  ✗ {name}")
     else:
         print()
+
+
+def _sanitize_dirname(name: str, max_len: int = 120) -> str:
+    """Make a string safe for use as a directory name on Windows and POSIX.
+
+    Strips Windows reserved chars (\\/:*?"<>|), control chars (\\n/\\r/\\t/\\x00-\\x1f —
+    album Names from the API can carry literal newlines where <br/> tags were),
+    collapses whitespace, removes trailing dots/spaces, and truncates to max_len.
+    """
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', ' ', name)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip().rstrip('. ')
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip().rstrip('. ')
+    return cleaned
 
 
 def download_agg_albums(url: str, store_path: str):
@@ -343,7 +376,7 @@ def download_agg_albums(url: str, store_path: str):
 
     for album_code, album_name, photo_qty in sub_albums:
         print(f"\n--- 子相冊: {album_name} ({photo_qty}張) [{album_code}] ---")
-        safe_name = re.sub(r'[\\/:*?"<>|]', '_', album_name)
+        safe_name = _sanitize_dirname(album_name) or album_code
         sub_store = os.path.join(store_path, safe_name)
         _download_album_by_code(album_code, sub_store)
 

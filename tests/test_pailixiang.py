@@ -417,35 +417,75 @@ class TestSanitizeDirname(unittest.TestCase):
         self.assertEqual(_sanitize_dirname("Title<br />Subtitle"), "Title br Subtitle")
 
 
-class TestPickImageUrl(unittest.TestCase):
-    def test_prefers_downloadImageUrl_when_http_url(self):
-        from core.pailixiang import _pick_image_url
+class TestResolvePhotoUrl(unittest.TestCase):
+    def test_pass_through_when_downloadImageUrl_is_real_http_url(self):
+        from core.pailixiang import _resolve_photo_url
         photo = {"DownloadImageUrl": "https://cdn.example.com/full.jpg",
                  "BigImageUrl": "https://cdn.example.com/big.jpg",
                  "ImageUrl": "https://cdn.example.com/small.jpg"}
-        self.assertEqual(_pick_image_url(photo), "https://cdn.example.com/full.jpg")
+        self.assertEqual(_resolve_photo_url(photo), "https://cdn.example.com/full.jpg")
 
-    def test_falls_back_to_bigImageUrl_when_downloadUrl_is_pipe_format(self):
-        from core.pailixiang import _pick_image_url
-        # When album disables full-res downloads (IsPhotoDownload=False), the API
-        # returns a pipe-delimited transfer ID instead of a URL — must fall back.
+    @patch("core.pailixiang._api_album_get_download_url")
+    def test_calls_transfer_endpoint_for_pipe_format_downloadUrl(self, mock_transfer):
+        from core.pailixiang import _resolve_photo_url
+        # Pipe-form DownloadImageUrl is exchanged via /WapAbm/GetPhotoDownloadUrl.
+        mock_transfer.return_value = "https://img1.pailixiang.com/trans/2606/688694296140802.jpg?Signature=abc"
         photo = {"DownloadImageUrl": "688694296140802|f61b6731-60b0-4947-8def-deef36201220|.jpg|0",
+                 "Name": "NG1_0466.JPG",
+                 "FileName": "28990655.jpg",
+                 "BigImageUrl": "https://thumbnail0.baidupcs.com/thumbnail/abc?size=c1600_u1600"}
+        self.assertEqual(_resolve_photo_url(photo),
+                         "https://img1.pailixiang.com/trans/2606/688694296140802.jpg?Signature=abc")
+        mock_transfer.assert_called_once_with(
+            param="688694296140802|f61b6731-60b0-4947-8def-deef36201220|.jpg|0",
+            origi_name="NG1_0466.JPG",
+            file_name="28990655.jpg",
+        )
+
+    @patch("core.pailixiang._api_album_get_download_url")
+    def test_falls_back_to_bigImageUrl_when_transfer_endpoint_fails(self, mock_transfer):
+        from core.pailixiang import _resolve_photo_url
+        # Restricted/paywalled albums reject the transfer request — fall back to preview.
+        mock_transfer.side_effect = ApiError(8, "需要付费下载")
+        photo = {"DownloadImageUrl": "688694296140802|f61b6731-60b0-4947-8def-deef36201220|.jpg|0",
+                 "Name": "NG1_0466.JPG",
+                 "FileName": "28990655.jpg",
                  "BigImageUrl": "https://thumbnail0.baidupcs.com/thumbnail/abc?size=c1600_u1600",
                  "ImageUrl": "https://thumbnail0.baidupcs.com/thumbnail/abc?size=c750_u1125"}
-        self.assertEqual(_pick_image_url(photo),
+        self.assertEqual(_resolve_photo_url(photo),
                          "https://thumbnail0.baidupcs.com/thumbnail/abc?size=c1600_u1600")
 
-    def test_falls_back_to_imageUrl_when_bigImageUrl_missing(self):
-        from core.pailixiang import _pick_image_url
-        photo = {"DownloadImageUrl": "N/A",
+    @patch("core.pailixiang._api_album_get_download_url")
+    def test_falls_back_to_imageUrl_when_bigImageUrl_missing(self, mock_transfer):
+        from core.pailixiang import _resolve_photo_url
+        mock_transfer.side_effect = ApiError(8, "denied")
+        photo = {"DownloadImageUrl": "garbage|not-a-real-url",
+                 "Name": "x.jpg",
+                 "FileName": "x.jpg",
                  "BigImageUrl": None,
                  "ImageUrl": "https://cdn.example.com/small.jpg"}
-        self.assertEqual(_pick_image_url(photo), "https://cdn.example.com/small.jpg")
+        self.assertEqual(_resolve_photo_url(photo), "https://cdn.example.com/small.jpg")
 
-    def test_returns_empty_when_no_valid_url(self):
-        from core.pailixiang import _pick_image_url
-        self.assertEqual(_pick_image_url({}), "")
-        self.assertEqual(_pick_image_url({"DownloadImageUrl": "garbage", "BigImageUrl": ""}), "")
+    def test_returns_empty_when_no_valid_url_and_no_pipe_form(self):
+        from core.pailixiang import _resolve_photo_url
+        self.assertEqual(_resolve_photo_url({}), "")
+        self.assertEqual(_resolve_photo_url({"DownloadImageUrl": "garbage-no-pipe", "BigImageUrl": ""}), "")
+
+
+class TestApiAlbumGetDownloadUrl(unittest.TestCase):
+    @patch("core.pailixiang._api_call")
+    @patch("core.pailixiang._build_payload")
+    def test_calls_get_photo_download_url_endpoint(self, mock_build, mock_call):
+        from core.pailixiang import _api_album_get_download_url, API_BASE
+        mock_build.return_value = {"pid": "albumview", "Param": "p", "OrigiName": "n", "FileName": "f"}
+        mock_call.return_value = "https://img1.pailixiang.com/trans/2606/x.jpg?Signature=y"
+        result = _api_album_get_download_url(param="p", origi_name="n", file_name="f")
+        self.assertEqual(result, "https://img1.pailixiang.com/trans/2606/x.jpg?Signature=y")
+        mock_build.assert_called_once_with(
+            pid="albumview", Param="p", OrigiName="n", FileName="f"
+        )
+        mock_call.assert_called_once_with(f"{API_BASE}/WapAbm/GetPhotoDownloadUrl",
+                                          {"pid": "albumview", "Param": "p", "OrigiName": "n", "FileName": "f"})
 
 
 class TestDownloadSingleAlbum(unittest.TestCase):

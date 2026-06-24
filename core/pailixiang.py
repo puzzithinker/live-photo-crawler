@@ -242,6 +242,24 @@ def _api_album_search_photo(album_id: str, start_index: int = 1, count: int = PA
     return _api_call(f"{API_BASE}/WapAbm/AlbumSearchPhoto", payload)
 
 
+def _api_album_get_download_url(param: str, origi_name: str, file_name: str) -> str:
+    """Exchange a photo's pipe-delimited transfer Param for a signed OSS URL.
+
+    Endpoint reverse-engineered from the SPA download-button (icon_download_photo)
+    handler: POST /WapAbm/GetPhotoDownloadUrl with Param/OrigiName/FileName taken
+    verbatim from the photo entity (DownloadImageUrl, Name, FileName respectively).
+    Returns Data as a string URL like
+    https://img1.pailixiang.com/trans/YYMM/{TransferID}.jpg?Signature=...
+    """
+    payload = _build_payload(
+        pid="albumview",
+        Param=param,
+        OrigiName=origi_name,
+        FileName=file_name,
+    )
+    return _api_call(f"{API_BASE}/WapAbm/GetPhotoDownloadUrl", payload)
+
+
 def _fetch_all_photos(album_id: str) -> list:
     all_photos = []
     page = 1
@@ -261,20 +279,38 @@ def _fetch_all_photos(album_id: str) -> list:
     return all_photos
 
 
-def _pick_image_url(photo: dict) -> str:
-    """Pick the best download URL for a photo.
+def _resolve_photo_url(photo: dict) -> str:
+    """Resolve a photo's download URL, preferring full-resolution transfer.
 
-    `DownloadImageUrl` is only a real URL when the album owner permits full-resolution
-    downloads (IsPhotoDownload=True). When downloads are disabled the API returns a
-    pipe-delimited transfer-ID placeholder (e.g. "ID|guid|.jpg|0") which is NOT a URL.
-    Fall back to BigImageUrl (largest public preview) then ImageUrl (smaller preview)
-    so the crawler still works against restricted albums.
+    On albums with IsPhotoDownload=True, DownloadImageUrl is already a real URL.
+    On restricted albums the API returns a pipe-delimited Param string
+    (e.g. "TransferID|guid|.jpg|0") which must be exchanged via
+    WapAbm/GetPhotoDownloadUrl for a signed img1.pailixiang.com/trans/... URL.
+    Falls back to BigImageUrl/ImageUrl (public preview thumbnail) only if the
+    transfer endpoint rejects the request (e.g. paywalled albums).
     """
-    candidates = (photo.get("DownloadImageUrl"), photo.get("BigImageUrl"), photo.get("ImageUrl"))
-    for url in candidates:
+    dl = photo.get("DownloadImageUrl")
+    if dl and isinstance(dl, str) and dl.startswith(("http://", "https://")):
+        return dl
+    if dl and isinstance(dl, str) and "|" in dl:
+        try:
+            return _api_album_get_download_url(
+                param=dl,
+                origi_name=photo.get("Name", ""),
+                file_name=photo.get("FileName", ""),
+            )
+        except ApiError as err:
+            print(f"\n  取得原圖網址失敗 ({photo.get('Name', '?')}): {err}")
+    for fallback_key in ("BigImageUrl", "ImageUrl"):
+        url = photo.get(fallback_key)
         if url and isinstance(url, str) and url.startswith(("http://", "https://")):
             return url
     return ""
+
+
+def _download_photo(photo: dict, filepath: str) -> bool:
+    url = _resolve_photo_url(photo)
+    return _download_image(url, filepath)
 
 
 def _download_album_by_code(album_code: str, store_path: str):
@@ -305,8 +341,7 @@ def _download_album_by_code(album_code: str, store_path: str):
         futures = {}
         for idx, photo in enumerate(all_photos, start=1):
             filepath = os.path.join(store_path, photo["Name"])
-            url = _pick_image_url(photo)
-            futures[executor.submit(_download_image, url, filepath)] = (idx, photo["Name"])
+            futures[executor.submit(_download_photo, photo, filepath)] = (idx, photo["Name"])
 
         for future in as_completed(futures):
             idx, name = futures[future]
